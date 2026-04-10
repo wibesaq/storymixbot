@@ -1,14 +1,15 @@
 import asyncio
 import requests
 import random
+import os
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-# --- КОНФИГУРАЦИЯ ---
-# Вставь свои данные сюда:
-BOT_TOKEN = "8513650923:AAF73kg1AxH1UlsGW7gDSZyOCDkeBLP0tNY"
-TMDB_API_KEY = "8dafad01b87d3621f0e3aa10a809f023"
+# --- ДАННЫЕ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_URL = "https://image.tmdb.org/t/p/w500"
@@ -16,7 +17,7 @@ IMAGE_URL = "https://image.tmdb.org/t/p/w500"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище для избранного
+# Внимание: список очистится при перезагрузке бота
 favorites = {}
 
 # --- ФУНКЦИИ ---
@@ -27,7 +28,7 @@ def get_movie_info(movie):
     desc = movie.get("overview", "Описание отсутствует.")
     poster = f"{IMAGE_URL}{movie.get('poster_path')}" if movie.get('poster_path') else None
     
-    # Текст без Markdown-разметки (* или _), чтобы бот не выдавал ошибку "can't parse entities"
+    # Мы помечаем строку с названием, чтобы потом вытащить её полностью
     text = f"🎬 Название: {title}\n\n⭐ Рейтинг: {rating}\n📅 Дата: {date}\n\n📖 {desc[:350]}..."
     return text, poster
 
@@ -44,23 +45,19 @@ async def fetch_movies(endpoint, params={}):
 
 async def send_movie_with_fav_button(message, movie):
     text, poster = get_movie_info(movie)
-    title = movie.get("title") or movie.get("name")
+    movie_id = movie.get("id") 
     
     kb = InlineKeyboardBuilder()
-    # Сохраняем первые 20 символов названия в кнопку
-    kb.button(text="💖 В избранное", callback_data=f"add_fav_{title[:20]}")
+    # Используем ID, чтобы не было ошибки из-за длины callback_data
+    kb.button(text="💖 В избранное", callback_data=f"add_fav_{movie_id}")
     
     try:
         if poster:
             await message.answer_photo(poster, caption=text, reply_markup=kb.as_markup())
         else:
             await message.answer(text, reply_markup=kb.as_markup())
-    except Exception as e:
-        # Если фото не грузится, пробуем отправить просто текст
-        try:
-            await message.answer(text, reply_markup=kb.as_markup())
-        except:
-            print(f"Не удалось отправить сообщение: {e}")
+    except:
+        await message.answer(text, reply_markup=kb.as_markup())
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -79,42 +76,53 @@ async def start_cmd(message: types.Message):
         "Под любым фильмом ты увидишь кнопку 'Добавить в избранное'."
     )
     
-    await message.answer(welcome_text, reply_markup=builder.as_markup(resize_keyboard=True))
+    await message.answer(
+        welcome_text,
+        reply_markup=builder.as_markup(resize_keyboard=True)
+    )
 
 @dp.message(F.text == "⭐ Избранное")
 async def show_favorites(message: types.Message):
     user_id = message.from_user.id
     if user_id not in favorites or not favorites[user_id]:
-        await message.answer("Твой список избранного пока пуст! 📌")
+        await message.answer("Ваш список избранного пока пуст 📌")
         return
     
     fav_list = "\n".join([f"📍 {t}" for t in favorites[user_id]])
-    await message.answer(f"Твои сохраненные фильмы:\n\n{fav_list}")
+    await message.answer(f"Твои фильмы:\n\n{fav_list}")
 
 @dp.callback_query(F.data.startswith("add_fav_"))
 async def add_to_favorites(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    movie_title = callback.data.replace("add_fav_", "")
+    
+    # Достаем полное название фильма из текста сообщения
+    message_text = callback.message.caption or callback.message.text
+    full_title = "Неизвестный фильм"
+    
+    if message_text:
+        for line in message_text.split('\n'):
+            if "🎬 Название:" in line:
+                full_title = line.replace("🎬 Название: ", "").strip()
+                break
     
     if user_id not in favorites:
         favorites[user_id] = []
     
-    if movie_title not in favorites[user_id]:
-        favorites[user_id].append(movie_title)
-        await callback.answer(f"Добавлено: {movie_title}")
+    if full_title not in favorites[user_id]:
+        favorites[user_id].append(full_title)
+        await callback.answer(f"Добавлено: {full_title[:20]}...", show_alert=False)
     else:
-        await callback.answer("Уже есть в списке!")
+        await callback.answer("Этот фильм уже есть в списке")
 
 @dp.message(F.text == "🔥 Популярные")
 async def popular_movies(message: types.Message):
     movies = await fetch_movies("/movie/popular")
-    # Берем 5 фильмов и отправляем каждый отдельным сообщением
     for movie in movies[:5]:
         await send_movie_with_fav_button(message, movie)
 
 @dp.message(F.text == "🎲 Случайный")
 async def random_movie(message: types.Message):
-    page = random.randint(1, 10)
+    page = random.randint(1, 20)
     movies = await fetch_movies("/movie/top_rated", params={"page": page})
     if movies:
         await send_movie_with_fav_button(message, random.choice(movies))
@@ -123,35 +131,42 @@ async def random_movie(message: types.Message):
 async def genre_menu(message: types.Message):
     builder = InlineKeyboardBuilder()
     genres = {28: "Боевик", 35: "Комедия", 18: "Драма", 27: "Ужасы", 878: "Фантастика"}
+    
     for g_id, g_name in genres.items():
         builder.button(text=g_name, callback_data=f"genre_{g_id}")
+    
     builder.adjust(2)
-    await message.answer("Выберите жанр:", reply_markup=builder.as_markup())
+    await message.answer("Выбери жанр:", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("genre_"))
 async def show_genre_movies(callback: types.CallbackQuery):
     genre_id = callback.data.split("_")[1]
     movies = await fetch_movies("/discover/movie", params={"with_genres": genre_id})
+    
     if movies:
         await send_movie_with_fav_button(callback.message, random.choice(movies))
+    
     await callback.answer()
 
 @dp.message()
 async def search_movie(message: types.Message):
-    if not message.text: return
+    if not message.text or message.text.startswith("/"):
+        return
+    
     movies = await fetch_movies("/search/movie", params={"query": message.text})
+    
     if movies:
         await send_movie_with_fav_button(message, movies[0])
     else:
-        await message.answer("Ничего не нашлось. Попробуй другое название.")
+        await message.answer("К сожалению, ничего не нашлось 😢")
 
 # --- ЗАПУСК ---
 async def main():
-    print("Бот запущен и готов к работе!")
+    print("Бот успешно запущен 🚀")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         print("Бот выключен")
